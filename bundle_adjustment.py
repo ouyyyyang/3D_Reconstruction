@@ -1,259 +1,17 @@
 import numpy as np
+from scipy.sparse import lil_matrix
+from scipy.optimize import least_squares
 
 
 def _rodrigues(r):
     theta = np.linalg.norm(r)
     if theta < 1e-12:
-        return np.eye(3), np.eye(3)
+        return np.eye(3)
     k = r / theta
     Kx = np.array([[0, -k[2], k[1]],
                    [k[2], 0, -k[0]],
                    [-k[1], k[0], 0]])
-    R = np.eye(3) + np.sin(theta) * Kx + (1 - np.cos(theta)) * (Kx @ Kx)
-
-    a = np.eye(3)
-    b = Kx
-    c = (1 - np.cos(theta)) / theta * Kx @ Kx
-    dR_dr = a + np.sin(theta) * b + c
-    return R, dR_dr
-
-
-def _project(K, rvec, t, X):
-    R, _ = _rodrigues(rvec)
-    x = R @ X + t
-    u = K[0, 0] * x[0] / x[2] + K[0, 2]
-    v = K[1, 1] * x[1] / x[2] + K[1, 2]
-    return np.array([u, v]), x
-
-
-def _compute_jacobian(K, rvec, t, X, eps=1e-6):
-    u0, _ = _project(K, rvec, t, X)
-    J_camera = np.zeros((2, 6))
-    for i in range(6):
-        delta = np.zeros(6)
-        delta[i] = eps
-        rvec_p = rvec + delta[:3]
-        t_p = t + delta[3:6]
-        up, _ = _project(K, rvec_p, t_p, X)
-        J_camera[:, i] = (up - u0) / eps
-
-    J_point = np.zeros((2, 3))
-    for i in range(3):
-        delta = np.zeros(3)
-        delta[i] = eps
-        up, _ = _project(K, rvec, t, X + delta)
-        J_point[:, i] = (up - u0) / eps
-
-    return J_camera, J_point
-
-
-def _quaternion_to_rotation(q):
-    w, x, y, z = q
-    R = np.array([
-        [1 - 2*y*y - 2*z*z, 2*x*y - 2*w*z, 2*x*z + 2*w*y],
-        [2*x*y + 2*w*z, 1 - 2*x*x - 2*z*z, 2*y*z - 2*w*x],
-        [2*x*z - 2*w*y, 2*y*z + 2*w*x, 1 - 2*x*x - 2*y*y],
-    ])
-    return R
-
-
-def _axis_angle_to_quaternion(rvec):
-    theta = np.linalg.norm(rvec)
-    if theta < 1e-12:
-        return np.array([1.0, 0.0, 0.0, 0.0])
-    axis = rvec / theta
-    half_theta = theta / 2.0
-    w = np.cos(half_theta)
-    s = np.sin(half_theta)
-    return np.array([w, s*axis[0], s*axis[1], s*axis[2]])
-
-
-def _assemble_system(cam_params, points3d, K, observations, huber_delta=1.0):
-    n_cams = len(cam_params)
-    n_pts = len(points3d)
-
-    num_obs = sum(len(obs) for obs in observations.values())
-
-    cam_block_size = 6
-    point_block_size = 3
-
-    J_list = []
-    r_list = []
-    obs_info = []
-
-    for pt_idx, (track_id, obs_dict) in enumerate(observations.items()):
-        for cam_idx, feat_idx in obs_dict.items():
-            u_obs = np.array(feat_idx) if isinstance(feat_idx, (list, tuple, np.ndarray)) else feat_idx
-
-    obs_map = []
-    track_id_to_idx = {}
-    for pt_idx, track_id in enumerate(observations.keys()):
-        track_id_to_idx[track_id] = pt_idx
-
-    for track_id, obs_dict in observations.items():
-        pt_idx = track_id_to_idx[track_id]
-        X = points3d[pt_idx]
-        for cam_idx, feat_idx in obs_dict.items():
-            obs_map.append({
-                'cam_idx': cam_idx,
-                'pt_idx': pt_idx,
-                'obs': feat_idx,
-                'global_cam_idx': cam_idx,
-            })
-
-    U = np.zeros((6 * n_cams, 6 * n_cams))
-    V_diag = [np.zeros((3, 3)) for _ in range(n_pts)]
-    W_list = [{} for _ in range(n_pts)]
-    g_c = np.zeros(6 * n_cams)
-    g_p = np.zeros(3 * n_pts)
-
-    total_error = 0.0
-    num_valid = 0
-
-    for track_id, obs_dict in observations.items():
-        if track_id in track_id_to_idx:
-            pt_idx = track_id_to_idx[track_id]
-        else:
-            continue
-
-        for cam_idx, feat_idx in obs_dict.items():
-            if cam_idx >= n_cams:
-                continue
-
-            rvec = cam_params[cam_idx][:3]
-            tvec = cam_params[cam_idx][3:6]
-
-            u_proj, x_cam = _project(K, rvec, tvec, points3d[pt_idx])
-
-            J_cam, J_pt = _compute_jacobian(K, rvec, tvec, points3d[pt_idx])
-
-            u_obs_pt = feat_idx[:2] if isinstance(feat_idx, (tuple, list, np.ndarray)) else feat_idx
-            residual = u_obs_pt - u_proj
-
-            err = np.linalg.norm(residual)
-            rho = 1.0
-            if huber_delta > 0 and err > huber_delta:
-                rho = np.sqrt(huber_delta / err)
-            total_error += err * err * rho
-
-            cam_start = 6 * cam_idx
-            pt_start = 3 * pt_idx
-
-            g_c[cam_start:cam_start + 6] += rho * J_cam.T @ residual
-            g_p[pt_start:pt_start + 3] += rho * J_pt.T @ residual
-
-            U[cam_start:cam_start + 6, cam_start:cam_start + 6] += rho * (J_cam.T @ J_cam)
-            V_diag[pt_idx] += rho * (J_pt.T @ J_pt)
-
-            W = rho * (J_cam.T @ J_pt)
-            if pt_idx in W_list:
-                if cam_idx in W_list[pt_idx]:
-                    W_list[pt_idx][cam_idx] += W
-                else:
-                    W_list[pt_idx][cam_idx] = W.copy()
-
-            num_valid += 1
-
-    return U, V_diag, W_list, g_c, g_p, total_error, num_valid
-
-
-def bundle_adjust(K, cameras, tracks_points, observations,
-                  max_iterations=20, huber_delta=1.0, lambda_init=1e-3):
-    n_cams = len(cameras)
-    n_pts = len(tracks_points)
-
-    cam_params = np.zeros((n_cams, 6))
-    for i, cam in enumerate(cameras):
-        rvec = _rotation_to_axis_angle(cam['R'])
-        cam_params[i, :3] = rvec
-        cam_params[i, 3:6] = cam['t']
-
-    points3d = np.array(tracks_points, dtype=np.float64)
-
-    lambda_ = lambda_init
-    prev_error = float('inf')
-
-    for iteration in range(max_iterations):
-        U, V_diag, W_list, g_c, g_p, total_error, num_valid = _assemble_system(
-            cam_params, points3d, K, observations, huber_delta)
-
-        if num_valid == 0:
-            break
-
-        lambda_I_cam = lambda_ * np.eye(6 * n_cams)
-        U_aug = U + lambda_I_cam
-
-        S = np.zeros((6 * n_cams, 6 * n_cams))
-        s_vec = np.zeros(6 * n_cams)
-
-        for pt_idx in range(n_pts):
-            V_aug = V_diag[pt_idx] + lambda_ * np.eye(3)
-            try:
-                V_inv = np.linalg.inv(V_aug)
-            except np.linalg.LinAlgError:
-                V_inv = np.linalg.pinv(V_aug)
-
-            for cam_idx, W_mat in W_list[pt_idx].items():
-                cam_start = 6 * cam_idx
-                pt_start = 3 * pt_idx
-
-                WVinv = W_mat @ V_inv
-                S[cam_start:cam_start + 6, cam_start:cam_start + 6] += WVinv @ W_mat.T
-                s_vec[cam_start:cam_start + 6] += WVinv @ g_p[pt_start:pt_start + 3]
-
-                for cam_idx2, W2_mat in W_list[pt_idx].items():
-                    if cam_idx2 > cam_idx:
-                        cam_start2 = 6 * cam_idx2
-                        SW = WVinv @ W2_mat.T
-                        S[cam_start:cam_start + 6, cam_start2:cam_start2 + 6] += SW
-                        S[cam_start2:cam_start2 + 6, cam_start:cam_start + 6] += SW.T
-
-        A = U_aug - S
-        b = g_c - s_vec
-
-        try:
-            delta_c = np.linalg.solve(A, b)
-        except np.linalg.LinAlgError:
-            delta_c = np.linalg.lstsq(A, b, rcond=None)[0]
-
-        delta_p = np.zeros(3 * n_pts)
-        for pt_idx in range(n_pts):
-            pt_start = 3 * pt_idx
-            V_aug = V_diag[pt_idx] + lambda_ * np.eye(3)
-            rhs = g_p[pt_start:pt_start + 3]
-            for cam_idx, W_mat in W_list[pt_idx].items():
-                delta_block = delta_c[6 * cam_idx:6 * cam_idx + 6]
-                rhs -= W_mat.T @ delta_block
-            try:
-                delta_p[pt_start:pt_start + 3] = np.linalg.solve(V_aug, rhs)
-            except np.linalg.LinAlgError:
-                delta_p[pt_start:pt_start + 3] = np.linalg.lstsq(V_aug, rhs, rcond=None)[0]
-
-        current_error = total_error
-
-        cam_params_new = cam_params + delta_c.reshape(n_cams, 6)
-        points3d_new = points3d + delta_p.reshape(n_pts, 3)
-
-        _, _, _, _, _, new_error, _ = _assemble_system(
-            cam_params_new, points3d_new, K, observations, huber_delta)
-
-        if new_error < current_error:
-            cam_params = cam_params_new
-            points3d = points3d_new
-            lambda_ = max(lambda_ * 0.5, 1e-12)
-            if current_error > 0 and (current_error - new_error) / current_error < 1e-8:
-                break
-        else:
-            lambda_ = min(lambda_ * 2.0, 1e6)
-
-    cameras_out = []
-    for i in range(n_cams):
-        rvec = cam_params[i, :3]
-        R = _rodrigues(rvec)[0]
-        t = cam_params[i, 3:6]
-        cameras_out.append({'R': R, 't': t})
-
-    return cameras_out, points3d
+    return np.eye(3) + np.sin(theta) * Kx + (1 - np.cos(theta)) * (Kx @ Kx)
 
 
 def _rotation_to_axis_angle(R):
@@ -266,3 +24,130 @@ def _rotation_to_axis_angle(R):
         R[1, 0] - R[0, 1],
     ]) / (2 * np.sin(theta))
     return axis * theta
+
+
+def bundle_adjust(K, cameras, tracks_points, observations,
+                   max_iterations=50, huber_delta=1.0, lambda_init=1e-3):
+    n_cams = len(cameras)
+    n_pts = len(tracks_points)
+
+    # --- pack parameter vector x = [rvec_0, t_0, ..., rvec_M, t_M, X_0, ..., X_N] ---
+    x0 = np.zeros(6 * n_cams + 3 * n_pts)
+    for i, cam in enumerate(cameras):
+        x0[6*i:6*i+3] = _rotation_to_axis_angle(cam['R'])
+        x0[6*i+3:6*i+6] = cam['t']
+    x0[6*n_cams:] = np.asarray(tracks_points, dtype=np.float64).ravel()
+
+    # --- precompute observation index arrays ---
+    obs_cam = []
+    obs_pt = []
+    obs_uv = []
+    for pt_idx, (track_id, obs_dict) in enumerate(observations.items()):
+        for cam_idx, uv in obs_dict.items():
+            if cam_idx < n_cams:
+                obs_cam.append(cam_idx)
+                obs_pt.append(pt_idx)
+                obs_uv.append(np.asarray(uv, dtype=np.float64).flatten()[:2])
+    obs_cam = np.array(obs_cam, dtype=np.int32)
+    obs_pt = np.array(obs_pt, dtype=np.int32)
+    obs_uv = np.array(obs_uv, dtype=np.float64)
+    n_obs = len(obs_cam)
+
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+
+    def residual(params):
+        cam_p = params[:6*n_cams].reshape(n_cams, 6)
+        pts = params[6*n_cams:].reshape(n_pts, 3)
+        r = np.empty(2 * n_obs)
+        for k in range(n_obs):
+            ci, pi = obs_cam[k], obs_pt[k]
+            R = _rodrigues(cam_p[ci, :3])
+            xc = R @ pts[pi] + cam_p[ci, 3:6]
+            z_inv = 1.0 / xc[2]
+            r[2*k]   = fx * xc[0] * z_inv + cx - obs_uv[k, 0]
+            r[2*k+1] = fy * xc[1] * z_inv + cy - obs_uv[k, 1]
+        return r
+
+    def jacobian(params):
+        cam_p = params[:6*n_cams].reshape(n_cams, 6)
+        pts = params[6*n_cams:].reshape(n_pts, 3)
+
+        J = lil_matrix((2 * n_obs, 6 * n_cams + 3 * n_pts))
+
+        for k in range(n_obs):
+            ci, pi = obs_cam[k], obs_pt[k]
+            rvec = cam_p[ci, :3]
+            t = cam_p[ci, 3:6]
+            X = pts[pi]
+
+            # Rodrigues + derivative w.r.t. rvec
+            theta = np.linalg.norm(rvec)
+            if theta < 1e-12:
+                R = np.eye(3)
+                # d(R@X)/drvec ≈ -[X]_×  (small-angle approximation)
+                dR_dr = np.array([[0, X[2], -X[1]],
+                                  [-X[2], 0, X[0]],
+                                  [X[1], -X[0], 0]])
+            else:
+                k_vec = rvec / theta
+                Kx = np.array([[0, -k_vec[2], k_vec[1]],
+                               [k_vec[2], 0, -k_vec[0]],
+                               [-k_vec[1], k_vec[0], 0]])
+                R = np.eye(3) + np.sin(theta) * Kx + (1 - np.cos(theta)) * (Kx @ Kx)
+                # Exact Rodrigues derivative: d(R@X)/drvec
+                a = R @ X
+                kX = np.cross(k_vec, X)
+                dR_dr = (-np.sin(theta) * np.outer(a, k_vec)
+                         + np.cos(theta) * np.outer(kX, k_vec)
+                         + np.sin(theta) * (k_vec[:, None] @ kX[None, :] - np.eye(3) * (k_vec @ kX)))
+
+            xc = R @ X + t
+            z = xc[2]
+            z2 = z * z
+
+            # Pixel derivative w.r.t. camera coords
+            du_dxc = np.array([fx / z, 0.0, -fx * xc[0] / z2])
+            dv_dxc = np.array([0.0, fy / z, -fy * xc[1] / z2])
+
+            # Chain to rvec, t, X
+            du_dr = du_dxc @ dR_dr
+            dv_dr = dv_dxc @ dR_dr
+            du_dt = du_dxc
+            dv_dt = dv_dxc
+            du_dX = du_dxc @ R
+            dv_dX = dv_dxc @ R
+
+            row = 2 * k
+            cam_col = 6 * ci
+            pt_col = 6 * n_cams + 3 * pi
+
+            J[row,   cam_col:cam_col+3] = du_dr
+            J[row,   cam_col+3:cam_col+6] = du_dt
+            J[row,   pt_col:pt_col+3] = du_dX
+            J[row+1, cam_col:cam_col+3] = dv_dr
+            J[row+1, cam_col+3:cam_col+6] = dv_dt
+            J[row+1, pt_col:pt_col+3] = dv_dX
+
+        return J.tocsr()
+
+    result = least_squares(
+        residual, x0, jacobian,
+        method='trf',
+        max_nfev=max_iterations,
+        x_scale='jac',
+        loss='huber' if huber_delta > 0 else 'linear',
+        f_scale=huber_delta if huber_delta > 0 else 1.0,
+        verbose=0,
+    )
+
+    # --- unpack ---
+    cam_p_final = result.x[:6*n_cams].reshape(n_cams, 6)
+    pts_final = result.x[6*n_cams:].reshape(n_pts, 3)
+
+    cameras_out = []
+    for i in range(n_cams):
+        R = _rodrigues(cam_p_final[i, :3])
+        cameras_out.append({'R': R, 't': cam_p_final[i, 3:6].copy()})
+
+    return cameras_out, pts_final

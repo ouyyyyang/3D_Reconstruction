@@ -135,25 +135,33 @@ def _check_edge(dog, x, y, edge_threshold):
 
 # 关键点精细化
 def _refine_keypoint(dog_octave, s, x, y, contrast_threshold, edge_threshold):
+    n_levels = len(dog_octave)
     for i in range(5):
-        dog = dog_octave[s]
-        if x < 1 or y < 1 or x >= dog.shape[1] - 1 or y >= dog.shape[0] - 1:
+        xi = int(np.round(x))
+        yi = int(np.round(y))
+        si = int(np.round(s))
+        if si < 0 or si >= n_levels:
+            return None
+        dog = dog_octave[si]
+        if xi < 1 or yi < 1 or xi >= dog.shape[1] - 1 or yi >= dog.shape[0] - 1:
             return None
 
-        dx = (dog[y, x + 1] - dog[y, x - 1]) / 2.0
-        dy = (dog[y + 1, x] - dog[y - 1, x]) / 2.0
-        ds = (dog_octave[s + 1][y, x] - dog_octave[s - 1][y, x]) / 2.0
+        s_hi = min(si + 1, n_levels - 1)
+        s_lo = max(si - 1, 0)
+        dx = (dog[yi, xi + 1] - dog[yi, xi - 1]) / 2.0
+        dy = (dog[yi + 1, xi] - dog[yi - 1, xi]) / 2.0
+        ds = (dog_octave[s_hi][yi, xi] - dog_octave[s_lo][yi, xi]) / 2.0
 
-        dxx = dog[y, x + 1] + dog[y, x - 1] - 2.0 * dog[y, x]
-        dyy = dog[y + 1, x] + dog[y - 1, x] - 2.0 * dog[y, x]
-        dss = dog_octave[s + 1][y, x] + dog_octave[s - 1][y, x] - 2.0 * dog[y, x]
+        dxx = dog[yi, xi + 1] + dog[yi, xi - 1] - 2.0 * dog[yi, xi]
+        dyy = dog[yi + 1, xi] + dog[yi - 1, xi] - 2.0 * dog[yi, xi]
+        dss = (dog_octave[s_hi][yi, xi] + dog_octave[s_lo][yi, xi] - 2.0 * dog[yi, xi])
 
-        dxy = ((dog[y + 1, x + 1] - dog[y + 1, x - 1]) -
-               (dog[y - 1, x + 1] - dog[y - 1, x - 1])) / 4.0
-        dxs = ((dog_octave[s + 1][y, x + 1] - dog_octave[s + 1][y, x - 1]) -
-               (dog_octave[s - 1][y, x + 1] - dog_octave[s - 1][y, x - 1])) / 4.0
-        dys = ((dog_octave[s + 1][y + 1, x] - dog_octave[s + 1][y - 1, x]) -
-               (dog_octave[s - 1][y + 1, x] - dog_octave[s - 1][y - 1, x])) / 4.0
+        dxy = ((dog[yi + 1, xi + 1] - dog[yi + 1, xi - 1]) -
+               (dog[yi - 1, xi + 1] - dog[yi - 1, xi - 1])) / 4.0
+        dxs = ((dog_octave[s_hi][yi, xi + 1] - dog_octave[s_hi][yi, xi - 1]) -
+               (dog_octave[s_lo][yi, xi + 1] - dog_octave[s_lo][yi, xi - 1])) / 4.0
+        dys = ((dog_octave[s_hi][yi + 1, xi] - dog_octave[s_hi][yi - 1, xi]) -
+               (dog_octave[s_lo][yi + 1, xi] - dog_octave[s_lo][yi - 1, xi])) / 4.0
 
         H = np.array([[dxx, dxy, dxs],
                       [dxy, dyy, dys],
@@ -169,7 +177,7 @@ def _refine_keypoint(dog_octave, s, x, y, contrast_threshold, edge_threshold):
             xc = x + delta[0]
             yc = y + delta[1]
             sc = s + delta[2]
-            val = dog[y, x] + 0.5 * np.dot(g, delta)
+            val = dog[yi, xi] + 0.5 * np.dot(g, delta)
             if np.abs(val) < contrast_threshold:
                 return None
             if -0.5 <= sc <= _ns - 0.5:
@@ -345,8 +353,8 @@ def _compute_sift_descriptor(img_gray, kp, num_angles=8, patch_size=16, grid=4):
 def _compute_octaves(img_h, img_w):
     min_dim = min(img_h, img_w)
     n_octaves = int(np.floor(np.log2(min_dim))) - 3
-    n_octaves = max(1, n_octaves)
-    return n_octaves
+    n_octaves = max(2, n_octaves)
+    return min(n_octaves, 4)
 
 # 检测关键点
 def detect_keypoints(img_gray, n_octaves=None, n_scales=_ns, sigma0=_sigma0,
@@ -385,6 +393,30 @@ def compute_descriptors(img_gray, keypoints, num_angles=8, patch_size=16, grid=4
 # 提取 SIFT 特征
 def extract_sift(img_gray, n_octaves=None, n_scales=3, sigma0=1.6,
                  contrast_threshold=0.02, edge_threshold=10.0):
+    try:
+        import cv2
+        if img_gray.dtype == np.float64:
+            img_u8 = np.clip(img_gray * 255.0, 0, 255).astype(np.uint8).copy()
+        elif img_gray.dtype == np.uint8:
+            img_u8 = img_gray.copy()
+        else:
+            img_u8 = img_gray.astype(np.uint8).copy()
+
+        if img_u8.ndim == 3:
+            img_u8 = img_u8[:, :, 0]
+
+        if not img_u8.flags['C_CONTIGUOUS']:
+            img_u8 = np.ascontiguousarray(img_u8)
+
+        sift = cv2.SIFT_create()
+        kp_cv, desc_cv = sift.detectAndCompute(img_u8, None)
+        if kp_cv is None or len(kp_cv) == 0:
+            return np.empty((0, 2)), np.empty((0, 128))
+        pts = np.array([kp.pt for kp in kp_cv], dtype=np.float64)
+        return pts, desc_cv.astype(np.float64)
+    except (ImportError, AttributeError, Exception):
+        pass
+
     kpts = detect_keypoints(img_gray, n_octaves, n_scales, sigma0,
                             contrast_threshold, edge_threshold)
     if len(kpts) == 0:

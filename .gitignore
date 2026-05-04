@@ -1,0 +1,22 @@
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 虚拟环境
+venv/
+.env/
+.venv/
+
+# 编辑器配置
+.vscode/
+.idea/
+
+# 日志
+*.log
+
+# readme
+CLAUDE.md
+CONTEXT.md
+readme/
